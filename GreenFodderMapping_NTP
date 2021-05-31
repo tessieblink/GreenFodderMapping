@@ -1,0 +1,205 @@
+/////////////////////0:Dataset and basic functions////////////////////////////
+// var palettes = require('users/gena/packages:colorbrewer').Palettes
+// var LandsatTool = require("users/nanshany1993/common:Landsat_16d");   
+///L8
+function maskL8sr(image) {
+  // Bits 3 and 5 are cloud shadow and cloud, respectively.
+  var cloudShadowBitMask = (1 << 3);
+  var cloudsBitMask = (1 << 5);
+  // Get the pixel QA band.
+  var qa = image.select('pixel_qa');
+  // Both flags should be set to zero, indicating clear conditions.
+  var mask = qa.bitwiseAnd(cloudShadowBitMask).eq(0)
+                .and(qa.bitwiseAnd(cloudsBitMask).eq(0));
+  return image.updateMask(mask);
+}
+
+///////*************0-Function to harmonization L5,7,8*********************///
+var coefficients = {
+  itcps: ee.Image.constant([0.0003, 0.0088, 0.0061, 0.0412, 0.0254, 0.0172])
+             .multiply(10000),
+  slopes: ee.Image.constant([0.8474, 0.8483, 0.9047, 0.8462, 0.8937, 0.9071])
+};
+
+// Function to get and rename bands of interest from OLI.
+function renameOli(img) {
+  return img.select(
+      ['B2', 'B3', 'B4', 'B5', 'B6', 'B7', 'pixel_qa'],
+      ['Blue', 'Green', 'Red', 'NIR', 'SWIR1', 'SWIR2', 'pixel_qa']);
+}
+// Function to get and rename bands of interest from ETM+.
+function renameEtm(img) {
+  return img.select(
+      ['B1', 'B2', 'B3', 'B4', 'B5', 'B7', 'pixel_qa'],
+      ['Blue', 'Green', 'Red', 'NIR', 'SWIR1', 'SWIR2', 'pixel_qa']);
+}
+
+//Function to transformation,applied to etm.
+function etmToOli(img) {
+  return img.select(['Blue', 'Green', 'Red', 'NIR', 'SWIR1', 'SWIR2'])
+      .multiply(coefficients.slopes)
+      .add(coefficients.itcps)
+      .round()
+      .toShort()
+      .addBands(img.select('pixel_qa'));
+}
+////Combine Functions
+// Define function to prepare OLI images.
+function prepOli(img) {
+  var orig = img;
+  img = renameOli(img);
+  img = maskL8sr(img);
+  img = VI(img);
+  return ee.Image(img.copyProperties(orig, orig.propertyNames()));
+}
+
+// Define function to prepare ETM+ images.
+function prepEtm(img) {
+  var orig = img;
+  img = renameEtm(img);
+  img = maskL8sr(img);
+  img = etmToOli(img);
+  img = VI(img);
+  return ee.Image(img.copyProperties(orig, orig.propertyNames()));
+}
+
+///Function to get VIs
+function VI(img) {
+  var ndvi = img.normalizedDifference(["NIR","Red"]);
+  var nir = img.select("NIR"); 
+  var red = img.select("Red");
+  var blue = img.select("Blue");
+  var evi = img.expression( "2.5 * (NIR - Red) / (NIR + 6*Red - 7.5*Blue + 10000)",
+    { "NIR": nir,
+      "Red": red,
+      "Blue": blue });
+  var lswi = img.normalizedDifference(["NIR","SWIR1"]);
+  var mask=ee.Image(1).where(lswi.gte(1).bitwiseOr(evi.gte(1)).bitwiseOr(ndvi.gte(1)).bitwiseOr(lswi.lte(-1)).bitwiseOr(evi.lte(-1)).bitwiseOr(ndvi.lte(-1)),0)
+  return img.addBands(ndvi.rename("NDVI"))
+            .addBands(lswi.rename("LSWI"))
+            .addBands(evi.rename("EVI"))
+            .updateMask(mask);
+}  //////Bands' names are like 'NIR'
+
+
+////////////////////////////////////////////////////////////////
+// Step 1: combine L5, L7 and L8
+var colFilter = ee.Filter.and(
+    ee.Filter.lt('CLOUD_COVER', 50), 
+    ee.Filter.lt('GEOMETRIC_RMSE_MODEL', 10),
+    ee.Filter.or(
+        ee.Filter.eq('IMAGE_QUALITY', 9),
+        ee.Filter.eq('IMAGE_QUALITY_OLI', 9)));
+
+var year=2019
+
+var tmCol = ee.ImageCollection('LANDSAT/LT05/C01/T1_SR') // the original is LE7_SR
+                    .filter(colFilter)
+                    .filterBounds(CBline)
+                    .filterDate((year-1).toString()+"-04-01",(year+1).toString()+"-10-31")   //.filterDate("2003-01-01","2003-12-31")
+                    .sort('system:time_start')
+                    .filterMetadata('reflectance',"not_equals",0)
+                    .map(prepEtm)
+
+var etmCol = ee.ImageCollection('LANDSAT/LE07/C01/T1_SR') // the original is LE7_SR
+                    .filter(colFilter)
+                    .filterBounds(CBline)
+                    .filterDate((year-1).toString()+"-04-01",(year+1).toString()+"-10-31")   //.filterDate("2003-01-01","2003-12-31")
+                    .sort('system:time_start')
+                    .filterMetadata('reflectance',"not_equals",0)
+                    .map(prepEtm)
+
+var oliCol = ee.ImageCollection('LANDSAT/LC08/C01/T1_SR') // the original is LE7_SR
+                    .filter(colFilter)
+                    .filterBounds(CBline)
+                    .filterDate((year-1).toString()+"-04-01",(year+1).toString()+"-10-31")   //.filterDate("2003-01-01","2003-12-31")
+                    .sort('system:time_start')
+                    .filterMetadata('reflectance',"not_equals",0)
+                    .map(prepOli)
+
+var ImageCollection=tmCol.merge(etmCol.merge(oliCol))
+print('merged',ImageCollection)
+
+
+// Step 2: mean composite image in June and Sep.
+var imgCol=ImageCollection.select(['NDVI','LSWI','EVI'])
+var SeptImage=imgCol.filter(ee.Filter.calendarRange(9,9,'month')).mean()
+var JunImage=imgCol.filter(ee.Filter.calendarRange(6,6,'month')).mean()
+print(SeptImage,'septImge')
+
+var myPalette = ['a50026','d73027','f46d43','fdae61','fee08b','ffffbf','d9ef8b','a6d96a','66bd63','1a9850','006837']
+Map.addLayer(SeptImage.select('LSWI'),{min:0.2,max:0.5,palette:myPalette},'Sept_LSWI')
+Map.addLayer(SeptImage.select('NDVI'),{min:0.1,max:0.8,palette:myPalette},'Sept_NDVI')
+
+
+// Step 3: Specify thresholds and extract silage
+var silageIndex = SeptImage.subtract(JunImage)
+Map.addLayer(silageIndex.select('LSWI'),{min:0.1,max:0.5,palette:myPalette},'diff_LSWI')
+
+var potentialSilage = silageIndex.select('LSWI').gt(0.3)
+// change the threshold of the NDVI in early stage
+var earlyCondition = JunImage.select('NDVI').lt(0.45)
+// add a LSWI threshold in the peak stage
+var peakCondition = SeptImage.select('NDVI').gt(0.4)
+var silage=potentialSilage.bitwise_and(earlyCondition)
+                    .bitwise_and(peakCondition)
+                    .rename('silage')
+                    
+print('silage',silage)
+Map.addLayer(silage.selfMask(),{min:0,max:1,palette:['000000','00CC66']},'silage')
+
+
+// Map.addLayer(silageTest_2010,{color:'red'},'silageTest_2010')
+// ////3-(2)DEM threshold
+// var hydrosheds = ee.Image('WWF/HydroSHEDS/03VFDEM');
+// var terrain = ee.Algorithms.Terrain(hydrosheds);
+// print('terrain',terrain)
+// var slope = terrain.select('slope');
+// var elevation=hydrosheds.select('b1');
+
+// var oat=oat1.and(slope.lte(15)).and(elevation.lte(4000)).rename('oat')
+// print(oat,'oat');
+// Map.addLayer(oat.clip(SA),{min:0,max:1,palette:['000000','00CC66']},'oat')
+
+
+// //////////////////////////5-Accuracy Assessment///////////////////////////
+// // //silage:1//non silage:0
+// // 2019 accuracy assessment
+// var silageSamples = silageTest.map(function(f){
+//   return ee.Feature(f.geometry(),{'truthClass':1})
+// })
+// print('silageSamples',silageSamples);
+// var nonSilageSamples = nonSilageTest.map(function(f){
+//   return ee.Feature(f.geometry(),{'truthClass':0})
+// })
+// print('nonSilageSamples',nonSilageSamples)
+
+// ///////
+// var testPoints = silageSamples.merge(nonSilageSamples)
+// print('testPoints',testPoints.limit(5))
+// print('hist',testPoints.aggregate_histogram('truthClass'))
+
+// var points = silage.sampleRegions({
+//     collection: testPoints, 
+//     properties: ['truthClass'], 
+//     scale: 30, 
+//     tileScale: 4, 
+//     geometries: false})
+// print('points',points)
+
+// var errorMatrix = points.errorMatrix('truthClass', 'silage')
+// var OA = errorMatrix.accuracy()
+// var PA = errorMatrix.producersAccuracy()
+// var CA = errorMatrix.consumersAccuracy()
+// var kappa = errorMatrix.kappa()
+// print(OA,PA,CA,kappa)
+// print(errorMatrix)
+
+
+
+////////////////6-Extra: Mapping////////////////////////////////////
+Map.addLayer(CBline,{},'CBline')
+var onr=oatChecked.merge(rapeChecked)
+var oat=oatChecked.merge(silageTest)
+Map.addLayer(oat,{color:'red'},'oat')
+
